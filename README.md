@@ -60,6 +60,11 @@ must be `1×3×640×640`.
   `PredCtl` and the tracking block of `filter_video_render()`, decoupled from the
   detection/tracking pipeline and easy to swap or experiment with.
 
+## Contributing
+
+Do not edit/push `main` directly. Fork or branch, then open a Pull Request — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 GPLv2 — see [LICENSE](LICENSE).

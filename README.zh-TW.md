@@ -50,6 +50,11 @@ OBS Studio 影像濾鏡：以 ONNX Runtime（DirectML）執行物件偵測，在
   集中在 `obs-detection-overlay.cpp` 的 `PredCtl` 與 `filter_video_render()` 追蹤區塊，
   與偵測/追蹤管線解耦，易於替換或實驗）。
 
+## 貢獻
+
+請勿直接在 `main` 編輯／推送。Fork 或開分支 → 發 Pull Request，詳見
+[CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ## 授權
 
 GPLv2 —— 見 [LICENSE](LICENSE)。
