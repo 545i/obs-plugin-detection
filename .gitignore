@@ -1,0 +1,10 @@
+# build artifacts
+build/
+build_*/
+*.obj
+*.exp
+*.ilk
+*.pdb
+
+# local scratch
+*.log
