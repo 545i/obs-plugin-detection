@@ -211,8 +211,11 @@ void Controller::tick()
 	mvx += ((double)(::rand() % 7) - 3.0) * js;
 	mvy += ((double)(::rand() % 7) - 3.0) * js;
 
-	mvx = std::clamp(mvx, -30000.0, 30000.0);
-	mvy = std::clamp(mvy, -30000.0, 30000.0);
+	// Per-move clamp (like Aimmy2's Clamp(-150,150)): caps a single move so a big
+	// initial error can't overshoot/spin; the rest converges over later frames.
+	const double lim = (cfg.max_step > 0.0f) ? (double)cfg.max_step : 30000.0;
+	mvx = std::clamp(mvx, -lim, lim);
+	mvy = std::clamp(mvy, -lim, lim);
 	const short sdx = (short)mvx, sdy = (short)mvy;
 	if (sdx == 0 && sdy == 0) return;
 

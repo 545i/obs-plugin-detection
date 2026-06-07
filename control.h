@@ -34,6 +34,7 @@ struct ControlConfig {
 	float smooth       = 0.30f;  // ease-out factor 0..1 (higher = snappier)
 	float snap_radius  = 0.0f;   // engage radius 0..1 (0 = whole frame)
 	float lead         = 0.0f;   // linear extrapolation lead time (seconds)
+	float max_step     = 0.0f;   // per-move clamp (device units); 0 = unlimited
 	float speed_x      = 1.0f, speed_y = 1.0f;
 	bool  pov_enable   = false;
 	int   pov_w        = 600, pov_h = 600;

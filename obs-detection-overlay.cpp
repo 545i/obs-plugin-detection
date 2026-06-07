@@ -132,6 +132,9 @@ static constexpr Backend  kBackend = Backend::DML;  // GPU via DirectML
 #define S_BOX_MODE     "box_display_mode"
 #define S_CLS_HEAD     "cls_head"     // class index treated as HEAD (model-specific)
 #define S_TRACK_OFFSET "track_offset" // mode-2 tracking point: frac of box height from top
+#define S_OFFSET0       "offset_mode0" // independent aim offset for box mode 0
+#define S_OFFSET1       "offset_mode1" // independent aim offset for box mode 1
+#define S_OFFSET_PREVIEW "offset_preview" // draw the aim point on the overlay
 
 static constexpr double kDefConf = 0.25;
 static constexpr double kDefIou = 0.45;
@@ -159,8 +162,7 @@ static constexpr int    kDefTrackTarget   = 0;     // 0=nearest-to-center, 1=by-
 static constexpr int    kDefTrackCls      = 0;
 static constexpr double kDefTrackGain     = 0.3;   // sensitivity: device units per pixel
 static constexpr double kDefTrackKi       = 0.0;   // engage radius (0 = whole frame)
-static constexpr double kDefTrackKd       = 2.0;   // dead-time compensation (frames)
-                                                   // (low now that inference is synchronous)
+static constexpr double kDefTrackKd       = 150.0; // per-move clamp (device units); 0=unlimited
 static constexpr double kDefTrackDeadzone = 5.0;
 static constexpr int    kDefTrackInterval = 2;     // send every N rendered frames
 static constexpr bool   kDefTrackSmooth   = false; // EMA smoothing on output
@@ -172,6 +174,9 @@ static constexpr double kDefTrackLead     = 0.0;   // velocity lead/prediction (
 static constexpr int    kDefBoxMode = 0;           // 0=head+body,1=head,2=head-track
 static constexpr int    kDefClsHead = 0;           // head class index in the model
 static constexpr double kDefTrackOffset = 0.11;    // mode-2 track point: frac of h from top
+static constexpr double kDefOffset0 = 0.25;        // mode-0 aim offset (frac of h)
+static constexpr double kDefOffset1 = 0.20;        // mode-1 aim offset (frac of h)
+static constexpr bool   kDefOffsetPreview = false; // draw aim point on overlay
 
 // Target-lock hysteresis: once locked onto a track, only switch to another
 // target that is at least (1 - ratio) NEARER than the locked one. A farther
@@ -190,15 +195,14 @@ static inline bool box_mode_should_process(int cls, int mode, int cls_head)
 	return mode == 0 ? true : (cls == cls_head);
 }
 
-// Tracking point for the auto-tracker, in the box's own pixel space. Mirrors
-// ScreenCapture::calculateTargetCenter + setOffset:
-//   mode 2 -> head region: (x + w/2, y + offset*h)  [offset configurable, 0..1]
-//   else   -> upper body : (x + w/2, y + 0.25*h)    [= cy - 0.25*h]
+// Tracking point for the auto-tracker, in the box's own pixel space:
+//   (x + w/2, y + offset*h)   -- offset is the per-box-mode value (0..1 of the
+//   box height from the top). Each box display mode (0/1/2) has its own offset.
 static inline void box_mode_track_point(float bx, float by, float bw, float bh,
-                                        int mode, float offset, float &tx, float &ty)
+                                        float offset, float &tx, float &ty)
 {
 	tx = bx + bw * 0.5f;
-	ty = (mode == 2) ? (by + bh * offset) : (by + bh * 0.25f);
+	ty = by + bh * offset;
 }
 
 // Centered SQUARE inference crop (ported from ScreenCapture::calculateCaptureRegion).
@@ -351,7 +355,10 @@ struct detector_filter {
 	// ---- box display mode (graphics thread): class filtering + track point ----
 	std::atomic<int>   box_mode{kDefBoxMode};
 	std::atomic<int>   cls_head{kDefClsHead};
-	std::atomic<float> track_offset{(float)kDefTrackOffset};
+	std::atomic<float> track_offset{(float)kDefTrackOffset};  // mode 2
+	std::atomic<float> offset0{(float)kDefOffset0};           // mode 0
+	std::atomic<float> offset1{(float)kDefOffset1};           // mode 1
+	std::atomic<bool>  offset_preview{kDefOffsetPreview};
 };
 
 // One filled axis-aligned quad (two triangles) in pixel space.
@@ -585,6 +592,9 @@ static void filter_update(void *data, obs_data_t *s)
 	}
 	f->track_offset.store((float)std::clamp(
 		obs_data_get_double(s, S_TRACK_OFFSET), 0.0, 1.0));
+	f->offset0.store((float)std::clamp(obs_data_get_double(s, S_OFFSET0), 0.0, 1.0));
+	f->offset1.store((float)std::clamp(obs_data_get_double(s, S_OFFSET1), 0.0, 1.0));
+	f->offset_preview.store(obs_data_get_bool(s, S_OFFSET_PREVIEW));
 
 	const char *mp = obs_data_get_string(s, S_MODEL);
 	if (mp && *mp) {
@@ -618,6 +628,7 @@ static ControlConfig build_control_config(detector_filter *f)
 	c.smooth       = f->track_gain.load();
 	c.snap_radius  = f->track_ki.load();
 	c.lead         = f->track_lead.load();
+	c.max_step     = f->track_kd.load();   // repurposed: per-move clamp
 	c.speed_x      = f->track_speed_x.load();
 	c.speed_y      = f->track_speed_y.load();
 	c.pov_enable   = f->pov_enable.load();
@@ -693,6 +704,9 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context)
 	}
 	f->track_offset.store((float)std::clamp(
 		obs_data_get_double(settings, S_TRACK_OFFSET), 0.0, 1.0));
+	f->offset0.store((float)std::clamp(obs_data_get_double(settings, S_OFFSET0), 0.0, 1.0));
+	f->offset1.store((float)std::clamp(obs_data_get_double(settings, S_OFFSET1), 0.0, 1.0));
+	f->offset_preview.store(obs_data_get_bool(settings, S_OFFSET_PREVIEW));
 
 	const char *mp = obs_data_get_string(settings, S_MODEL);
 	{
@@ -979,10 +993,15 @@ static void filter_video_render(void *data, gs_effect_t *effect)
 	// relative to the image center, and collect the boxes that survive.
 	const int   box_mode     = f->box_mode.load();
 	const int   cls_head     = f->cls_head.load();
-	const float track_offset = f->track_offset.load();
+	// Independent aim offset per box display mode (0/1/2), fraction of box height.
+	const float mode_offset  = (box_mode == 0) ? f->offset0.load()
+	                         : (box_mode == 1) ? f->offset1.load()
+	                                           : f->track_offset.load();
+	const bool  offset_preview = f->offset_preview.load();
 
 	std::vector<box_px>    draw_boxes;
 	std::vector<ObjCenter> cs;
+	std::vector<box_px>    aim_pts;  // aim points for the preview overlay
 	draw_boxes.reserve(boxes.size());
 	cs.reserve(boxes.size());
 	for (const TrackedBox &tb : boxes) {
@@ -999,10 +1018,9 @@ static void filter_video_render(void *data, gs_effect_t *effect)
 		               ocy < roi_t || ocy > roi_b))
 			continue;  // outside ROI -> fully filtered out
 
-		// Tracking point per box display mode (head region in mode 2, upper
-		// body otherwise) -> offset from image center for the auto-tracker.
+		// Tracking point: (cx, top + mode_offset*h) -> offset from image center.
 		float tpx, tpy;
-		box_mode_track_point(bx, by, bw, bh, box_mode, track_offset, tpx, tpy);
+		box_mode_track_point(bx, by, bw, bh, mode_offset, tpx, tpy);
 
 		// Target velocity at the tracking point, in SOURCE px/sec (Kalman
 		// estimate scaled from net space). Used for lead/prediction below.
@@ -1032,6 +1050,12 @@ static void filter_video_render(void *data, gs_effect_t *effect)
 		box_px b;
 		b.x = bx; b.y = by; b.w = bw; b.h = bh;
 		draw_boxes.push_back(b);
+
+		if (offset_preview) {
+			box_px a;  // store the aim point (x,y); w/h unused
+			a.x = tpx; a.y = tpy; a.w = 0.0f; a.h = 0.0f;
+			aim_pts.push_back(a);
+		}
 	}
 
 	{
@@ -1109,6 +1133,22 @@ static void filter_video_render(void *data, gs_effect_t *effect)
 		r.x = pov_l; r.y = pov_t; r.w = pov_w; r.h = pov_h;
 		while (gs_effect_loop(solid, "Solid"))
 			draw_box_outline(&r, thick);
+	}
+
+	// aim-point preview (magenta crosses) -- where the controller aims on each
+	// box, given the current mode's offset. Lets you tune the offset visually.
+	if (offset_preview && !aim_pts.empty()) {
+		struct vec4 magenta;
+		vec4_set(&magenta, 1.0f, 0.0f, 1.0f, 1.0f);
+		gs_effect_set_vec4(color_param, &magenta);
+		const float L  = std::max(6.0f, thick * 3.0f);
+		const float ht = thick;
+		while (gs_effect_loop(solid, "Solid")) {
+			for (const box_px &a : aim_pts) {
+				draw_filled_rect(a.x - L, a.y - ht * 0.5f, 2.0f * L, ht);
+				draw_filled_rect(a.x - ht * 0.5f, a.y - L, ht, 2.0f * L);
+			}
+		}
 	}
 
 	// center-of-frame marker crosshair (yellow), always shown -- the polar origin
@@ -1276,6 +1316,9 @@ static void filter_get_defaults(obs_data_t *s)
 	obs_data_set_default_int(s, S_BOX_MODE, kDefBoxMode);
 	obs_data_set_default_int(s, S_CLS_HEAD, kDefClsHead);
 	obs_data_set_default_double(s, S_TRACK_OFFSET, kDefTrackOffset);
+	obs_data_set_default_double(s, S_OFFSET0, kDefOffset0);
+	obs_data_set_default_double(s, S_OFFSET1, kDefOffset1);
+	obs_data_set_default_bool(s, S_OFFSET_PREVIEW, kDefOffsetPreview);
 }
 
 static obs_properties_t *filter_get_properties(void *data)
@@ -1313,8 +1356,14 @@ static obs_properties_t *filter_get_properties(void *data)
 	obs_property_list_add_int(bm, obs_module_text("BoxModeHead"),     1);
 	obs_property_list_add_int(bm, obs_module_text("BoxModeHeadTrack"), 2);
 	obs_properties_add_int(gb, S_CLS_HEAD, obs_module_text("ClsHead"), 0, 255, 1);
+	// Independent aim offset per box display mode (0/1/2), + a preview marker.
+	obs_properties_add_float_slider(gb, S_OFFSET0,
+	                                obs_module_text("Offset0"), 0.0, 1.0, 0.01);
+	obs_properties_add_float_slider(gb, S_OFFSET1,
+	                                obs_module_text("Offset1"), 0.0, 1.0, 0.01);
 	obs_properties_add_float_slider(gb, S_TRACK_OFFSET,
-	                                obs_module_text("TrackOffset"), 0.0, 1.0, 0.01);
+	                                obs_module_text("Offset2"), 0.0, 1.0, 0.01);
+	obs_properties_add_bool(gb, S_OFFSET_PREVIEW, obs_module_text("OffsetPreview"));
 	obs_properties_add_group(p, "grp_box", obs_module_text("GrpBox"),
 	                         OBS_GROUP_NORMAL, gb);
 
@@ -1385,6 +1434,8 @@ static obs_properties_t *filter_get_properties(void *data)
 	                                obs_module_text("TrackSnapRadius"), 0.0, 1.0, 0.01);
 	obs_properties_add_float_slider(gt, S_TRACK_LEAD,
 	                                obs_module_text("TrackLead"), 0.0, 0.5, 0.005);
+	obs_properties_add_float_slider(gt, S_TRACK_KD,
+	                                obs_module_text("TrackMaxStep"), 0.0, 500.0, 5.0);
 	obs_properties_add_float_slider(gt, S_TRACK_SPEED_X,
 	                                obs_module_text("TrackSpeedX"), 0.05, 5.0, 0.05);
 	obs_properties_add_float_slider(gt, S_TRACK_SPEED_Y,
