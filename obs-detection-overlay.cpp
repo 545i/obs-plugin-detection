@@ -42,6 +42,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <cstdio>
 #include <cstring>
@@ -56,6 +57,7 @@
 #include "detection_postprocess.hpp"  // struct Detection, decode(), nms(), coco_names
 #include "tracker.hpp"                // BoxTracker (Kalman smoothing)
 #include "device.h"                   // DeviceController (motion/gimbal device DLL)
+#include "control.h"                  // Controller (independent auto-tracking loop)
 // NOTE: device.h #includes "device_symbols.h" (the SYM_* export-name strings for
 // the real device.dll). That file is supplied separately by the device owner and
 // is REQUIRED to compile this plugin. Until it is present in this folder the
@@ -156,7 +158,7 @@ static constexpr int    kDefTrackTrigger  = -1;    // default: always-on for eas
 static constexpr int    kDefTrackTarget   = 0;     // 0=nearest-to-center, 1=by-class
 static constexpr int    kDefTrackCls      = 0;
 static constexpr double kDefTrackGain     = 0.3;   // sensitivity: device units per pixel
-static constexpr double kDefTrackKi       = 1.0;   // velocity feedforward gain
+static constexpr double kDefTrackKi       = 0.0;   // engage radius (0 = whole frame)
 static constexpr double kDefTrackKd       = 2.0;   // dead-time compensation (frames)
                                                    // (low now that inference is synchronous)
 static constexpr double kDefTrackDeadzone = 5.0;
@@ -215,47 +217,6 @@ static inline void infer_crop(int cx, int cy, int region,
 	x0 = (cx - side) / 2;
 	y0 = (cy - side) / 2;
 }
-
-// ---------------------------------------------------------------------------
-// Dead-time-compensated predictive controller (Smith-predictor-lite).
-//
-// The actuator (gimbal) is fast/ideal, but the SENSOR (vision pipeline:
-// capture defer + async inference + Kalman smoothing) is delayed by ~deadN
-// frames. A plain proportional/PID law re-commands the SAME error every frame
-// until the move's effect finally appears, sending ~deadN times the needed
-// correction -> overshoot + spiral/oscillation even at low gain (an integral
-// makes it strictly worse). The cure is to remember the correction commands
-// still "in flight" (sent but not yet visible) and subtract them:
-//   cmd = sens*err - inflight   (+ velocity feedforward, handled by the caller)
-// so we never re-order motion we've already ordered. With sens ~ 1/device_gain
-// this is near-deadbeat and does NOT oscillate; deadN only needs to be roughly
-// right (too small -> mild ring, too large -> a bit sluggish, never unstable).
-// ---------------------------------------------------------------------------
-struct PredCtl {
-	std::deque<double> hx, hy;       // correction commands still in flight
-	double sumx = 0.0, sumy = 0.0;   // running sums of hx / hy
-
-	// Position-correction command (pre speed/FF/deadzone) for this frame.
-	void command(double errX, double errY, double sens,
-	             double &cx, double &cy) const
-	{
-		cx = sens * errX - sumx;
-		cy = sens * errY - sumy;
-	}
-
-	// Record the correction ACTUALLY sent this frame (0 if nothing went out) and
-	// age out anything older than the dead-time window.
-	void commit(double sentX, double sentY, int deadN)
-	{
-		if (deadN < 1) deadN = 1;
-		hx.push_back(sentX); sumx += sentX;
-		hy.push_back(sentY); sumy += sentY;
-		while ((int)hx.size() > deadN) { sumx -= hx.front(); hx.pop_front(); }
-		while ((int)hy.size() > deadN) { sumy -= hy.front(); hy.pop_front(); }
-	}
-
-	void reset() { hx.clear(); hy.clear(); sumx = sumy = 0.0; }
-};
 
 // One detection box, in SOURCE/CANVAS pixel coordinates. (Outline color is set
 // via the solid effect's "color" param at draw time, not stored per-box.)
@@ -345,18 +306,23 @@ struct detector_filter {
 	std::atomic<int>  model_num_classes{kNumClasses}; // C-4 from the model output
 	std::atomic<bool> out_shape_logged{false};        // log the shape once/model
 
-	// ---- object centers (SOURCE pixels), refreshed every rendered frame ----
+	// ---- object centers (SOURCE pixels), refreshed every rendered frame.
+	// Kept for the periodic log and detector_get_centers(); the auto-tracking
+	// controller gets its own snapshot via controller.publish() each frame. ----
 	std::mutex             centers_mtx;
-	std::vector<ObjCenter> centers;  // guarded by centers_mtx; for later use
+	std::vector<ObjCenter> centers;  // guarded by centers_mtx
 
 	// ---- Kalman smoothing (graphics thread ONLY: tick + render) ----
 	std::atomic<bool> smoothing{kDefSmooth};
 	BoxTracker        tracker;       // operates in 640-network-space
 	uint64_t          tick_seq = 0;  // last result_seq consumed by the tracker
 
-	// ---- worker thread ----
+	// ---- worker thread (inference) ----
 	std::thread        worker;
 	std::atomic<bool>  running{false};
+
+	// ---- independent auto-tracking controller (owns its own thread) ----
+	Controller         controller;
 
 	Detector *detector = nullptr;  // worker thread ONLY
 
@@ -386,11 +352,6 @@ struct detector_filter {
 	std::atomic<int>   box_mode{kDefBoxMode};
 	std::atomic<int>   cls_head{kDefClsHead};
 	std::atomic<float> track_offset{(float)kDefTrackOffset};
-
-	PredCtl            track_pid;  // dead-time-compensated controller (graphics thread)
-	double             track_ema_x = 0.0, track_ema_y = 0.0;  // EMA state
-	int                track_locked_id = -1;  // graphics thread: locked track id
-	                                          // (-1 = none; needs smoothing ON)
 };
 
 // One filled axis-aligned quad (two triangles) in pixel space.
@@ -559,6 +520,8 @@ static const char *filter_get_name(void *unused)
 	return obs_module_text("DetectionOverlayFilter");
 }
 
+static ControlConfig build_control_config(detector_filter *f);  // defined below
+
 // Read live settings and request a model reload if the path changed.
 static void filter_update(void *data, obs_data_t *s)
 {
@@ -596,10 +559,8 @@ static void filter_update(void *data, obs_data_t *s)
 		f->dev_ui_path = dp ? dp : "";
 	}
 
-	// Auto-tracking parameters. Only write to atomics here — track_pid is owned
-	// exclusively by the graphics thread (video_render) and must NOT be written
-	// from this UI-thread callback to avoid a data race. video_render syncs
-	// track_pid from the atomics at the top of each tracking pass.
+	// Auto-tracking parameters: write to atomics only. The independent control
+	// thread reads these atomics every tick (no locking needed).
 	f->track_enable.store(obs_data_get_bool(s, S_TRACK_ENABLE));
 	f->track_trigger_vk.store((int)obs_data_get_int(s, S_TRACK_TRIGGER));
 	f->track_target_mode.store((int)obs_data_get_int(s, S_TRACK_TARGET));
@@ -640,6 +601,30 @@ static void filter_update(void *data, obs_data_t *s)
 			f->in_cv.notify_one();  // wake the worker to reload now
 		}
 	}
+
+	// Push the latest knobs to the auto-tracking controller.
+	f->controller.set_config(build_control_config(f));
+}
+
+// Build the controller config from the filter's live atomics (reused gain/ki
+// fields: track_gain = smoothing, track_ki = engage radius).
+static ControlConfig build_control_config(detector_filter *f)
+{
+	ControlConfig c;
+	c.enable       = f->track_enable.load();
+	c.trigger_vk   = f->track_trigger_vk.load();
+	c.target_mode  = f->track_target_mode.load();
+	c.target_cls   = f->track_target_cls.load();
+	c.smooth       = f->track_gain.load();
+	c.snap_radius  = f->track_ki.load();
+	c.lead         = f->track_lead.load();
+	c.speed_x      = f->track_speed_x.load();
+	c.speed_y      = f->track_speed_y.load();
+	c.pov_enable   = f->pov_enable.load();
+	c.pov_w        = f->pov_w.load();
+	c.pov_h        = f->pov_h.load();
+	c.switch_ratio = kTrackSwitchRatio;
+	return c;
 }
 
 // ===========================================================================
@@ -682,8 +667,8 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context)
 		f->pov_h.store(ph < 2 ? 2 : ph);
 	}
 
-	// Auto-tracking initial values. Write atomics only; track_pid is synced
-	// by video_render on first frame (before any tracking call).
+	// Auto-tracking initial values. Write atomics only; the control thread reads
+	// them every tick.
 	f->track_enable.store(obs_data_get_bool(settings, S_TRACK_ENABLE));
 	f->track_trigger_vk.store((int)obs_data_get_int(settings, S_TRACK_TRIGGER));
 	f->track_target_mode.store((int)obs_data_get_int(settings, S_TRACK_TARGET));
@@ -718,6 +703,17 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context)
 
 	f->running.store(true, std::memory_order_release);
 	f->worker     = std::thread(inference_worker, f);
+
+	// Independent auto-tracking controller: relative device moves via a callback
+	// that locks dev_mtx (the device may be (re)loaded/freed on the UI thread).
+	f->controller.set_send_fn([f](short dx, short dy) -> bool {
+		std::lock_guard<std::mutex> lk(f->dev_mtx);
+		if (f->device && f->device->isReady())
+			return f->device->sendDelta(dx, dy);
+		return false;
+	});
+	f->controller.set_config(build_control_config(f));
+	f->controller.start();
 	return f;
 }
 
@@ -726,6 +722,10 @@ static void filter_destroy(void *data)
 	auto *f = static_cast<detector_filter *>(data);
 
 	f->running.store(false, std::memory_order_release);
+
+	// Stop the control thread first (its send callback touches the device).
+	f->controller.stop();
+
 	{
 		std::lock_guard<std::mutex> lk(f->in_mtx);
 		f->frame_ready = true;  // force the wait predicate true
@@ -980,7 +980,6 @@ static void filter_video_render(void *data, gs_effect_t *effect)
 	const int   box_mode     = f->box_mode.load();
 	const int   cls_head     = f->cls_head.load();
 	const float track_offset = f->track_offset.load();
-	const float track_lead   = f->track_lead.load();  // seconds of prediction
 
 	std::vector<box_px>    draw_boxes;
 	std::vector<ObjCenter> cs;
@@ -1020,13 +1019,11 @@ static void filter_video_render(void *data, gs_effect_t *effect)
 		c.dy = ocy - icy;
 		c.track_vx = vsx;
 		c.track_vy = vsy;
-		// LEAD/PREDICTION: aim where the target WILL be in track_lead seconds
-		// (pos + velocity*lead). This cancels the steady-state lag of the P
-		// controller and the loop latency, so a moving target centers instead
-		// of being perpetually chased. Control aim only — the drawn box stays
-		// at the actual position.
-		c.track_dx = (tpx + vsx * track_lead) - icx;
-		c.track_dy = (tpy + vsy * track_lead) - icy;
+		// Tracking point offset from image center (in source px). The CONTROL
+		// thread does velocity prediction (pos + vel*age) at its own high rate,
+		// so no lead is pre-applied here.
+		c.track_dx = tpx - icx;
+		c.track_dy = tpy - icy;
 		c.dist = std::sqrt(c.dx * c.dx + c.dy * c.dy);
 		// screen-y points DOWN: negate dy so +90 deg points UP.
 		c.angle = std::atan2(-c.dy, c.dx) * kRad2Deg;
@@ -1039,199 +1036,16 @@ static void filter_video_render(void *data, gs_effect_t *effect)
 
 	{
 		std::lock_guard<std::mutex> lk(f->centers_mtx);
-		f->centers = cs;  // COPY (not swap): cs must stay valid for the
-		                  // auto-tracking pass below. swap() would hand cs the
-		                  // PREVIOUS frame's centers -> a full frame of control
-		                  // latency (root cause of the "always chasing" lag).
+		f->centers = cs;  // keep for the periodic log + detector_get_centers()
 	}
 
-	// ---- auto-tracking: pick a target, run PID, send delta to device ----
-	// Uses `cs` (THIS frame's centers; published as a copy above). All tunables
-	// sync'd from atomics each pass.
-	if (f->track_enable.load()) {
-		// --- trigger key check ---
-		// -1 = always-on (test mode): track every frame, no key needed.
-		//  0 = none/disabled: never track.
-		// >0 = VK code: GetAsyncKeyState queries real-time hardware state
-		//      (high bit set = key physically held), works on any thread.
-		const int trigger_vk = f->track_trigger_vk.load();
-		bool key_held = false;
-		bool dev_ready = false;
-		{
-			std::lock_guard<std::mutex> dlk(f->dev_mtx);
-			dev_ready = (f->device != nullptr && f->device->isReady());
-		}
-		if (trigger_vk == -1) {
-			key_held = true;
-		} else if (trigger_vk > 0) {
-			key_held = (::GetAsyncKeyState(trigger_vk) & 0x8000) != 0;
-		}
-
-		// Diagnostic: log tracking state every 60 frames so we can see
-		// exactly which condition is blocking movement.
-		if ((f->frame_counter % 60) == 0) {
-			blog(LOG_INFO,
-			     "[obs-detection-overlay] TRACK dbg: enable=%d "
-			     "vk=%s dev_ready=%d key_held=%d targets=%zu",
-			     (int)f->track_enable.load(),
-			     trigger_vk == -1 ? "always-on" :
-			     trigger_vk ==  0 ? "none(off)" :
-			     [&]{ static char buf[8];
-			          snprintf(buf, sizeof buf, "0x%02X", trigger_vk);
-			          return buf; }(),
-			     (int)dev_ready, (int)key_held, cs.size());
-		}
-
-		if (!key_held) {
-			f->track_pid.reset();
-			f->track_ema_x = 0.0;
-			f->track_ema_y = 0.0;
-			f->track_locked_id = -1;  // release trigger -> drop the lock
-		} else {
-
-		if (!cs.empty()) {
-			// --- target selection (with target LOCK + hysteresis) ---
-			// Stateless "nearest every frame" causes target stealing: when the
-			// locked near target briefly drops out (occlusion / inference gap /
-			// a Kalman miss) a farther target becomes momentarily nearest and
-			// the controller lurches to it. Fix: remember the locked track id and
-			// keep it; only switch to a target that is CLEARLY nearer. A farther
-			// target can never steal the lock. (Lock needs smoothing ON for
-			// stable ids; with smoothing off all ids are -1 -> nearest fallback.)
-			const int mode     = f->track_target_mode.load();
-			const int want_cls = f->track_target_cls.load();
-
-			// POV gate: only targets whose center is inside the POV rect are
-			// trackable (off -> everything). Applies to the locked target too,
-			// so a target leaving the POV drops the lock.
-			auto in_pov = [&](const ObjCenter &c) {
-				return !pov_on || (c.cx >= pov_l && c.cx <= pov_r &&
-				                   c.cy >= pov_t && c.cy <= pov_b);
-			};
-
-			const ObjCenter *nearest = nullptr;   // nearest eligible candidate
-			const ObjCenter *locked  = nullptr;   // the locked track, if on-screen
-			float nearest_dist = std::numeric_limits<float>::max();
-			for (const ObjCenter &c : cs) {
-				if (!in_pov(c))
-					continue;  // outside POV -> detected/drawn but not trackable
-				if (mode == 1 && c.cls != want_cls)
-					continue;  // by-class mode restricts the candidate set
-				if (c.dist < nearest_dist) {
-					nearest_dist = c.dist;
-					nearest = &c;
-				}
-				if (f->track_locked_id >= 0 && c.id == f->track_locked_id)
-					locked = &c;
-			}
-			// By-class mode with no class match this frame: fall back to the
-			// nearest of ANY class (still POV-gated) and drop the invalid lock.
-			if (!nearest) {
-				for (const ObjCenter &c : cs)
-					if (in_pov(c) && c.dist < nearest_dist) {
-						nearest_dist = c.dist;
-						nearest = &c;
-					}
-				locked = nullptr;
-			}
-
-			// Keep the locked target unless a rival is >=(1-ratio) nearer.
-			const int prev_lock = f->track_locked_id;
-			const ObjCenter *sel;
-			if (locked) {
-				sel = (nearest && nearest != locked &&
-				       nearest->dist < locked->dist * kTrackSwitchRatio)
-				          ? nearest
-				          : locked;
-			} else {
-				sel = nearest;  // no valid lock -> acquire the nearest
-			}
-			f->track_locked_id = sel ? sel->id : -1;  // -1 when smoothing off
-
-			// Switching/acquiring a target: clear PID derivative + EMA so the
-			// D term doesn't kick on the stale-error jump to the new target.
-			if (f->track_locked_id != prev_lock) {
-				f->track_pid.reset();
-				f->track_ema_x = 0.0;
-				f->track_ema_y = 0.0;
-			}
-
-			if (sel) {
-				// --- dead-time-compensated predictive control ---
-				const float  dz    = f->track_deadzone.load();
-				const double sens  = (double)f->track_gain.load();  // units/px
-				const double velff = (double)f->track_ki.load();    // vel feedforward
-				int deadN = (int)std::lround((double)f->track_kd.load());
-				if (deadN < 1) deadN = 1;                            // dead-time frames
-				const double spx = (double)f->track_speed_x.load();
-				const double spy = (double)f->track_speed_y.load();
-
-				// Position correction with in-flight subtraction. Tracks the
-				// box-display-mode point (head in mode 2, upper body otherwise).
-				double corrX, corrY;
-				f->track_pid.command((double)sel->track_dx, (double)sel->track_dy,
-				                     sens, corrX, corrY);
-
-				// Velocity feedforward: keep pace with a MOVING target so it
-				// centers instead of being chased. track_vx/vy are px/sec; /60
-				// approximates per-frame (velff absorbs the residual fps factor).
-				const double ffX = velff * sens * (double)sel->track_vx / 60.0;
-				const double ffY = velff * sens * (double)sel->track_vy / 60.0;
-
-				double moveX = (corrX + ffX) * spx;
-				double moveY = (corrY + ffY) * spy;
-
-				// --- optional EMA smoothing on the output ---
-				if (f->track_smooth_ema.load()) {
-					constexpr double kAlpha = 0.5;
-					f->track_ema_x = kAlpha * moveX + (1.0 - kAlpha) * f->track_ema_x;
-					f->track_ema_y = kAlpha * moveY + (1.0 - kAlpha) * f->track_ema_y;
-					moveX = f->track_ema_x;
-					moveY = f->track_ema_y;
-				} else {
-					f->track_ema_x = moveX;
-					f->track_ema_y = moveY;
-				}
-
-				// --- deadzone + send-interval gating ---
-				const bool x_live = std::abs(moveX) > (double)dz;
-				const bool y_live = std::abs(moveY) > (double)dz;
-				const int  ti = f->track_send_interval.load();
-				const bool send_now =
-					((f->frame_counter - 1) % (uint64_t)(ti < 1 ? 1 : ti)) == 0;
-
-				const short sdx = (x_live && send_now) ? (short)moveX : 0;
-				const short sdy = (y_live && send_now) ? (short)moveY : 0;
-
-				if (sdx != 0 || sdy != 0) {
-					std::lock_guard<std::mutex> dlk(f->dev_mtx);
-					if (f->device && f->device->isReady())
-						f->device->sendDelta(sdx, sdy);
-				}
-
-				// Record the CORRECTION actually sent (exclude feedforward, which
-				// cancels target motion rather than reducing the error). Commit
-				// every frame so the in-flight window stays frame-aligned.
-				f->track_pid.commit(sdx != 0 ? corrX * spx : 0.0,
-				                    sdy != 0 ? corrY * spy : 0.0, deadN);
-
-				if ((f->frame_counter % 60) == 0) {
-					blog(LOG_INFO,
-					     "[obs-detection-overlay] TRACK ctl: lock=id%d err=(%.0f,%.0f) "
-					     "corr=(%.1f,%.1f) ff=(%.1f,%.1f) -> send=(%d,%d) deadN=%d",
-					     sel->id, (double)sel->track_dx, (double)sel->track_dy,
-					     corrX, corrY, ffX, ffY, (int)sdx, (int)sdy, deadN);
-				}
-			}
-		} else {
-			// no targets on screen -> drop the lock
-			f->track_pid.reset();
-			f->track_ema_x = 0.0;
-			f->track_ema_y = 0.0;
-			f->track_locked_id = -1;
-		}
-		} // end key_held
-	}
+	// Hand this frame's targets to the independent auto-tracking controller.
+	std::vector<ControlTarget> targets;
+	targets.reserve(cs.size());
+	for (const ObjCenter &c : cs)
+		targets.push_back({c.id, c.cls, c.cx, c.cy,
+		                   c.track_dx, c.track_dy, c.track_vx, c.track_vy, c.dist});
+	f->controller.publish(std::move(targets), (int)cx, (int)cy);
 
 	// Periodic log so the saved centers (polar, ROI-filtered) can be verified.
 	if ((f->frame_counter % 120) == 0) {
@@ -1563,25 +1377,21 @@ static obs_properties_t *filter_get_properties(void *data)
 	obs_properties_add_int(gt, S_TRACK_CLS, obs_module_text("TrackTargetCls0"),
 	                       0, 255, 1);
 
-	// Controller (in tuning order): sensitivity -> dead-time -> feedforward ->
-	// per-axis speed -> deadzone -> send rate -> output smoothing.
+	// Controller (absolute-positioning + ease, 125Hz control thread):
+	//   smoothing -> prediction -> per-axis speed -> deadzone.
 	obs_properties_add_float_slider(gt, S_TRACK_GAIN,
-	                                obs_module_text("TrackSens"), 0.01, 3.0, 0.01);
-	obs_properties_add_float_slider(gt, S_TRACK_KD,
-	                                obs_module_text("TrackDeadFrames"), 1.0, 12.0, 1.0);
+	                                obs_module_text("TrackSmoothFactor"), 0.01, 1.0, 0.01);
 	obs_properties_add_float_slider(gt, S_TRACK_KI,
-	                                obs_module_text("TrackVelFf"), 0.0, 3.0, 0.05);
+	                                obs_module_text("TrackSnapRadius"), 0.0, 1.0, 0.01);
+	obs_properties_add_float_slider(gt, S_TRACK_LEAD,
+	                                obs_module_text("TrackLead"), 0.0, 0.5, 0.005);
 	obs_properties_add_float_slider(gt, S_TRACK_SPEED_X,
 	                                obs_module_text("TrackSpeedX"), 0.05, 5.0, 0.05);
 	obs_properties_add_float_slider(gt, S_TRACK_SPEED_Y,
 	                                obs_module_text("TrackSpeedY"), 0.05, 5.0, 0.05);
-	obs_properties_add_float_slider(gt, S_TRACK_DEADZONE,
+	obs_property_t *tdz = obs_properties_add_float_slider(gt, S_TRACK_DEADZONE,
 	                                obs_module_text("TrackDeadzone"), 0.0, 200.0, 1.0);
-	obs_properties_add_int_slider(gt, S_TRACK_INTERVAL,
-	                              obs_module_text("TrackSendInterval"), 1, 16, 1);
-	obs_properties_add_float_slider(gt, S_TRACK_LEAD,
-	                                obs_module_text("TrackLead"), 0.0, 2.0, 0.01);
-	obs_properties_add_bool(gt, S_TRACK_SMOOTH, obs_module_text("TrackSmooth"));
+	obs_property_float_set_suffix(tdz, " px");
 	obs_properties_add_group(p, "grp_track", obs_module_text("GrpTrack"),
 	                         OBS_GROUP_NORMAL, gt);
 

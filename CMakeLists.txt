@@ -7,6 +7,8 @@ target_sources(
   obs-detection-overlay
   PRIVATE
     obs-detection-overlay.cpp
+    control.cpp
+    control.h
     detector.hpp
     detection_postprocess.hpp
     tracker.hpp
