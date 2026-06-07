@@ -190,7 +190,9 @@ void Controller::tick()
 
 	// Per-move clamp (like Aimmy2's Clamp(-150,150)): caps a single move so a big
 	// initial error can't overshoot/spin; the rest converges over later frames.
-	const double lim = (cfg.max_step > 0.0f) ? (double)cfg.max_step : 30000.0;
+	// A clamp below 1 px is meaningless (it would freeze all movement -- e.g. a
+	// stale value inherited from the old "PID D" field), so treat it as unlimited.
+	const double lim = (cfg.max_step >= 1.0f) ? (double)cfg.max_step : 30000.0;
 	mvx = std::clamp(mvx, -lim, lim);
 	mvy = std::clamp(mvy, -lim, lim);
 	const short sdx = (short)mvx, sdy = (short)mvy;
