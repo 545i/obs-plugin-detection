@@ -5,7 +5,6 @@
 // move (sendDelta), which is what works for in-game mouse-look.
 #include "control.h"
 
-#include <obs-module.h>  // blog (temporary diagnostics)
 #include <windows.h>
 
 #include <algorithm>
@@ -95,28 +94,19 @@ void Controller::thread_main()
 // One control iteration (control thread only).
 void Controller::tick()
 {
-	static unsigned s_dbg = 0;
-	const bool dbg = (++s_dbg % 120u) == 0;  // ~1.5s at 8ms ticks (temporary)
-
 	ControlConfig cfg;
 	{
 		std::lock_guard<std::mutex> lk(cfg_mtx_);
 		cfg = cfg_;
 	}
-	if (!cfg.enable) {
-		if (dbg) blog(LOG_INFO, "[control] idle: enable=0");
-		locked_id_ = -1; return;
-	}
+	if (!cfg.enable) { locked_id_ = -1; return; }
 
 	// Fire/trigger key: -1 = always on, 0 = off, >0 = VK held.
 	const bool key_held =
 		(cfg.trigger_vk == -1) ? true
 		: (cfg.trigger_vk > 0) ? ((::GetAsyncKeyState(cfg.trigger_vk) & 0x8000) != 0)
 		                       : false;
-	if (!key_held) {
-		if (dbg) blog(LOG_INFO, "[control] idle: key not held (vk=%d)", cfg.trigger_vk);
-		locked_id_ = -1; return;
-	}
+	if (!key_held) { locked_id_ = -1; return; }
 
 	std::vector<ControlTarget> cs;
 	int fw, fh;
@@ -126,11 +116,7 @@ void Controller::tick()
 		fw = frame_w_;
 		fh = frame_h_;
 	}
-	if (cs.empty() || fw <= 0 || fh <= 0) {
-		if (dbg) blog(LOG_INFO, "[control] idle: no targets (n=%zu fw=%d fh=%d)",
-		              cs.size(), fw, fh);
-		locked_id_ = -1; return;
-	}
+	if (cs.empty() || fw <= 0 || fh <= 0) { locked_id_ = -1; return; }
 
 	const int sw = ::GetSystemMetrics(SM_CXSCREEN);
 	const int sh = ::GetSystemMetrics(SM_CYSCREEN);
@@ -167,10 +153,7 @@ void Controller::tick()
 		    nearest->dist < locked->dist * cfg.switch_ratio) ? nearest : locked)
 		: nearest;
 	locked_id_ = sel ? sel->id : -1;
-	if (!sel) {
-		if (dbg) blog(LOG_INFO, "[control] idle: no eligible target (POV/class)");
-		return;
-	}
+	if (!sel) return;
 
 	// Error = target's offset from the CROSSHAIR (= fixed screen center), in
 	// SCREEN px. NO GetCursorPos: in a cursor-locked game it doesn't reflect the
@@ -187,17 +170,11 @@ void Controller::tick()
 	const double dist = std::sqrt(dx * dx + dy * dy);
 	if (cfg.snap_radius > 0.0f) {
 		const double dnx = dx / sw, dny = dy / sh;
-		if (std::sqrt(dnx * dnx + dny * dny) > cfg.snap_radius) {
-			if (dbg) blog(LOG_INFO, "[control] idle: target outside snap_radius "
-			              "(distn=%.3f > %.3f)",
-			              std::sqrt(dnx*dnx+dny*dny), cfg.snap_radius);
+		if (std::sqrt(dnx * dnx + dny * dny) > cfg.snap_radius)
 			return;
-		}
 	}
-	if (dist < 1.0) {
-		if (dbg) blog(LOG_INFO, "[control] on-target: dist<1px, hold");
+	if (dist < 1.0)
 		return;
-	}
 
 	// ease-out cubic toward the target, per-axis speed.
 	double t = std::clamp((double)cfg.smooth, 0.05, 1.0);
@@ -219,9 +196,6 @@ void Controller::tick()
 	const short sdx = (short)mvx, sdy = (short)mvy;
 	if (sdx == 0 && sdy == 0) return;
 
-	const bool sent = send_fn_ ? send_fn_(sdx, sdy) : false;
-	if (dbg)
-		blog(LOG_INFO, "[control] MOVE err=(%.0f,%.0f) -> send=(%d,%d) sent=%d "
-		     "(fw=%d sw=%d smooth=%.2f)",
-		     dx, dy, (int)sdx, (int)sdy, (int)sent, fw, sw, cfg.smooth);
+	if (send_fn_)
+		send_fn_(sdx, sdy);  // relative eased move
 }

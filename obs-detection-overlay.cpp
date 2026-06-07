@@ -1151,18 +1151,6 @@ static void filter_video_render(void *data, gs_effect_t *effect)
 		}
 	}
 
-	// center-of-frame marker crosshair (yellow), always shown -- the polar origin
-	{
-		struct vec4 yellow;
-		vec4_set(&yellow, 1.0f, 1.0f, 0.0f, 1.0f);
-		gs_effect_set_vec4(color_param, &yellow);
-		const float L  = std::max(10.0f, thick * 5.0f);
-		const float ht = thick;
-		while (gs_effect_loop(solid, "Solid")) {
-			draw_filled_rect(icx - L, icy - ht * 0.5f, 2.0f * L, ht);
-			draw_filled_rect(icx - ht * 0.5f, icy - L, ht, 2.0f * L);
-		}
-	}
 	gs_load_vertexbuffer(NULL);
 }
 
