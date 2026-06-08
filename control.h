@@ -47,6 +47,15 @@ struct ControlConfig {
 	bool  humanize     = false;
 	float react_ms     = 150.0f;  // reaction delay before engaging a new target
 	float accel_ms     = 120.0f;  // ease-in (acceleration) ramp duration
+	// Valorant-style sensitivity calibration. The device sends raw COUNTS
+	// (measured 1:1 on the desktop), and the game turns 1 count into
+	// sens*0.07 degrees of view rotation (DPI-independent; verified against pro
+	// cm/360 ~= 45cm). So to bring a target that is N screen-px from the
+	// crosshair onto it we send N*(fov_deg/screen_width)/(sens*0.07) counts.
+	// Off -> the move is taken as 1 count = 1 screen px.
+	bool  calib_enable = false;
+	float game_sens    = 0.40f;   // in-game sensitivity (e.g. Valorant)
+	float fov_deg      = 103.0f;  // horizontal FOV (Valorant 16:9 = 103)
 };
 
 class Controller {

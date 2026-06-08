@@ -125,6 +125,9 @@ static constexpr Backend  kBackend = Backend::DML;  // GPU via DirectML
 #define S_HUMANIZE       "humanize"           // human reaction delay + ease-in
 #define S_REACT_MS       "react_ms"           // reaction delay (ms) on new lock
 #define S_ACCEL_MS       "accel_ms"           // ease-in ramp duration (ms)
+#define S_CALIB_ENABLE   "calib_enable"       // Valorant sensitivity calibration
+#define S_GAME_SENS      "game_sens"          // in-game sensitivity
+#define S_FOV_DEG        "fov_deg"            // horizontal FOV (deg)
 
 // Box display mode (ported from ScreenCapture::setBoxDisplayMode):
 //   0 = head+body  : process ALL detections (== "head OR body" for the 2-class
@@ -176,6 +179,9 @@ static constexpr double kDefTrackLead     = 0.0;   // velocity lead/prediction (
 static constexpr bool   kDefHumanize      = false; // reaction delay + ease-in
 static constexpr double kDefReactMs       = 150.0; // reaction delay (ms)
 static constexpr double kDefAccelMs       = 120.0; // ease-in ramp (ms)
+static constexpr bool   kDefCalibEnable   = false; // sensitivity calibration off
+static constexpr double kDefGameSens      = 0.40;  // in-game sensitivity (Valorant)
+static constexpr double kDefFovDeg        = 103.0; // horizontal FOV (Valorant 16:9)
 
 static constexpr int    kDefBoxMode = 0;           // 0=head+body,1=head,2=head-track
 static constexpr int    kDefClsHead = 0;           // head class index in the model
@@ -360,6 +366,9 @@ struct detector_filter {
 	std::atomic<bool>  humanize{kDefHumanize};
 	std::atomic<float> react_ms{(float)kDefReactMs};
 	std::atomic<float> accel_ms{(float)kDefAccelMs};
+	std::atomic<bool>  calib_enable{kDefCalibEnable};
+	std::atomic<float> game_sens{(float)kDefGameSens};
+	std::atomic<float> fov_deg{(float)kDefFovDeg};
 
 	// ---- box display mode (graphics thread): class filtering + track point ----
 	std::atomic<int>   box_mode{kDefBoxMode};
@@ -596,6 +605,9 @@ static void filter_update(void *data, obs_data_t *s)
 	f->humanize.store(obs_data_get_bool(s, S_HUMANIZE));
 	f->react_ms.store((float)obs_data_get_double(s, S_REACT_MS));
 	f->accel_ms.store((float)obs_data_get_double(s, S_ACCEL_MS));
+	f->calib_enable.store(obs_data_get_bool(s, S_CALIB_ENABLE));
+	f->game_sens.store((float)obs_data_get_double(s, S_GAME_SENS));
+	f->fov_deg.store((float)obs_data_get_double(s, S_FOV_DEG));
 
 	f->box_mode.store((int)obs_data_get_int(s, S_BOX_MODE));
 	{
@@ -650,6 +662,9 @@ static ControlConfig build_control_config(detector_filter *f)
 	c.humanize     = f->humanize.load();
 	c.react_ms     = f->react_ms.load();
 	c.accel_ms     = f->accel_ms.load();
+	c.calib_enable = f->calib_enable.load();
+	c.game_sens    = f->game_sens.load();
+	c.fov_deg      = f->fov_deg.load();
 	return c;
 }
 
@@ -714,6 +729,9 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context)
 	f->humanize.store(obs_data_get_bool(settings, S_HUMANIZE));
 	f->react_ms.store((float)obs_data_get_double(settings, S_REACT_MS));
 	f->accel_ms.store((float)obs_data_get_double(settings, S_ACCEL_MS));
+	f->calib_enable.store(obs_data_get_bool(settings, S_CALIB_ENABLE));
+	f->game_sens.store((float)obs_data_get_double(settings, S_GAME_SENS));
+	f->fov_deg.store((float)obs_data_get_double(settings, S_FOV_DEG));
 
 	f->box_mode.store((int)obs_data_get_int(settings, S_BOX_MODE));
 	{
@@ -1322,6 +1340,9 @@ static void filter_get_defaults(obs_data_t *s)
 	obs_data_set_default_bool(s, S_HUMANIZE, kDefHumanize);
 	obs_data_set_default_double(s, S_REACT_MS, kDefReactMs);
 	obs_data_set_default_double(s, S_ACCEL_MS, kDefAccelMs);
+	obs_data_set_default_bool(s, S_CALIB_ENABLE, kDefCalibEnable);
+	obs_data_set_default_double(s, S_GAME_SENS, kDefGameSens);
+	obs_data_set_default_double(s, S_FOV_DEG, kDefFovDeg);
 	obs_data_set_default_int(s, S_BOX_MODE, kDefBoxMode);
 	obs_data_set_default_int(s, S_CLS_HEAD, kDefClsHead);
 	obs_data_set_default_double(s, S_TRACK_OFFSET, kDefTrackOffset);
@@ -1460,6 +1481,13 @@ static obs_properties_t *filter_get_properties(void *data)
 	obs_property_t *tam = obs_properties_add_int(gt, S_ACCEL_MS,
 	                                obs_module_text("AccelMs"), 0, 500, 5);
 	obs_property_int_set_suffix(tam, " ms");
+	// Sensitivity calibration (Valorant): counts = px*(fov/screen_w)/(sens*0.07).
+	obs_properties_add_bool(gt, S_CALIB_ENABLE, obs_module_text("CalibEnable"));
+	obs_properties_add_float_slider(gt, S_GAME_SENS,
+	                                obs_module_text("GameSens"), 0.05, 5.0, 0.001);
+	obs_property_t *tfov = obs_properties_add_float_slider(gt, S_FOV_DEG,
+	                                obs_module_text("FovDeg"), 60.0, 130.0, 1.0);
+	obs_property_float_set_suffix(tfov, " °");
 	obs_properties_add_group(p, "grp_track", obs_module_text("GrpTrack"),
 	                         OBS_GROUP_NORMAL, gt);
 

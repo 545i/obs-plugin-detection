@@ -174,16 +174,29 @@ void Controller::tick()
 	// "relative velocity" no longer reverses -- we never use absolute velocity).
 	const double sxr = (double)sw / (double)fw;
 	const double syr = (double)sh / (double)fh;
-	const double dx = (sel->track_dx + sel->track_vx * cfg.lead) * sxr;
-	const double dy = (sel->track_dy + sel->track_vy * cfg.lead) * syr;
+	double dx = (sel->track_dx + sel->track_vx * cfg.lead) * sxr;  // screen px
+	double dy = (sel->track_dy + sel->track_vy * cfg.lead) * syr;  // screen px
 
-	// Engage radius (normalized 0-1) measured from the crosshair. 0 = always.
-	const double dist = std::sqrt(dx * dx + dy * dy);
+	// Engage radius (normalized 0-1) measured from the crosshair, on the
+	// screen-px error (before any unit conversion). 0 = always.
 	if (cfg.snap_radius > 0.0f) {
 		const double dnx = dx / sw, dny = dy / sh;
 		if (std::sqrt(dnx * dnx + dny * dny) > cfg.snap_radius)
 			return;
 	}
+
+	// Sensitivity calibration: convert the screen-px error into device COUNTS.
+	// deg/px = fov_deg/screen_width; counts/deg = 1/(sens*0.07). The device is
+	// raw 1:1 (measured), so OFF means 1 count = 1 screen px. After this the
+	// whole pipeline (ease, jitter, max_step clamp) is in counts.
+	if (cfg.calib_enable && cfg.game_sens > 0.0f) {
+		const double counts_per_px =
+			((double)cfg.fov_deg / (double)sw) / ((double)cfg.game_sens * 0.07);
+		dx *= counts_per_px;
+		dy *= counts_per_px;
+	}
+
+	const double dist = std::sqrt(dx * dx + dy * dy);
 	if (dist < 1.0)
 		return;
 
