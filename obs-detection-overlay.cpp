@@ -128,6 +128,7 @@ static constexpr Backend  kBackend = Backend::DML;  // GPU via DirectML
 #define S_CALIB_ENABLE   "calib_enable"       // Valorant sensitivity calibration
 #define S_GAME_SENS      "game_sens"          // in-game sensitivity
 #define S_FOV_DEG        "fov_deg"            // horizontal FOV (deg)
+#define S_FOV_V_DEG      "fov_v_deg"          // vertical FOV (deg; 0 = auto)
 
 // Box display mode (ported from ScreenCapture::setBoxDisplayMode):
 //   0 = head+body  : process ALL detections (== "head OR body" for the 2-class
@@ -182,6 +183,7 @@ static constexpr double kDefAccelMs       = 120.0; // ease-in ramp (ms)
 static constexpr bool   kDefCalibEnable   = false; // sensitivity calibration off
 static constexpr double kDefGameSens      = 0.40;  // in-game sensitivity (Valorant)
 static constexpr double kDefFovDeg        = 103.0; // horizontal FOV (Valorant 16:9)
+static constexpr double kDefFovVDeg       = 0.0;   // vertical FOV (0 = auto/square)
 
 static constexpr int    kDefBoxMode = 0;           // 0=head+body,1=head,2=head-track
 static constexpr int    kDefClsHead = 0;           // head class index in the model
@@ -369,6 +371,7 @@ struct detector_filter {
 	std::atomic<bool>  calib_enable{kDefCalibEnable};
 	std::atomic<float> game_sens{(float)kDefGameSens};
 	std::atomic<float> fov_deg{(float)kDefFovDeg};
+	std::atomic<float> fov_v_deg{(float)kDefFovVDeg};
 
 	// ---- box display mode (graphics thread): class filtering + track point ----
 	std::atomic<int>   box_mode{kDefBoxMode};
@@ -608,6 +611,7 @@ static void filter_update(void *data, obs_data_t *s)
 	f->calib_enable.store(obs_data_get_bool(s, S_CALIB_ENABLE));
 	f->game_sens.store((float)obs_data_get_double(s, S_GAME_SENS));
 	f->fov_deg.store((float)obs_data_get_double(s, S_FOV_DEG));
+	f->fov_v_deg.store((float)obs_data_get_double(s, S_FOV_V_DEG));
 
 	f->box_mode.store((int)obs_data_get_int(s, S_BOX_MODE));
 	{
@@ -665,6 +669,7 @@ static ControlConfig build_control_config(detector_filter *f)
 	c.calib_enable = f->calib_enable.load();
 	c.game_sens    = f->game_sens.load();
 	c.fov_deg      = f->fov_deg.load();
+	c.fov_v_deg    = f->fov_v_deg.load();
 	return c;
 }
 
@@ -732,6 +737,7 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context)
 	f->calib_enable.store(obs_data_get_bool(settings, S_CALIB_ENABLE));
 	f->game_sens.store((float)obs_data_get_double(settings, S_GAME_SENS));
 	f->fov_deg.store((float)obs_data_get_double(settings, S_FOV_DEG));
+	f->fov_v_deg.store((float)obs_data_get_double(settings, S_FOV_V_DEG));
 
 	f->box_mode.store((int)obs_data_get_int(settings, S_BOX_MODE));
 	{
@@ -1343,6 +1349,7 @@ static void filter_get_defaults(obs_data_t *s)
 	obs_data_set_default_bool(s, S_CALIB_ENABLE, kDefCalibEnable);
 	obs_data_set_default_double(s, S_GAME_SENS, kDefGameSens);
 	obs_data_set_default_double(s, S_FOV_DEG, kDefFovDeg);
+	obs_data_set_default_double(s, S_FOV_V_DEG, kDefFovVDeg);
 	obs_data_set_default_int(s, S_BOX_MODE, kDefBoxMode);
 	obs_data_set_default_int(s, S_CLS_HEAD, kDefClsHead);
 	obs_data_set_default_double(s, S_TRACK_OFFSET, kDefTrackOffset);
@@ -1488,6 +1495,9 @@ static obs_properties_t *filter_get_properties(void *data)
 	obs_property_t *tfov = obs_properties_add_float_slider(gt, S_FOV_DEG,
 	                                obs_module_text("FovDeg"), 60.0, 130.0, 1.0);
 	obs_property_float_set_suffix(tfov, " °");
+	obs_property_t *tfovv = obs_properties_add_float_slider(gt, S_FOV_V_DEG,
+	                                obs_module_text("FovVDeg"), 0.0, 130.0, 1.0);
+	obs_property_float_set_suffix(tfovv, " °");
 	obs_properties_add_group(p, "grp_track", obs_module_text("GrpTrack"),
 	                         OBS_GROUP_NORMAL, gt);
 

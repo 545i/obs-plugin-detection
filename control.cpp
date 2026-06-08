@@ -196,11 +196,18 @@ void Controller::tick()
 	// After this the whole pipeline (ease, jitter, max_step clamp) is in counts.
 	if (cfg.calib_enable && cfg.game_sens > 0.0f && cfg.fov_deg > 1.0f) {
 		constexpr double kPi = 3.14159265358979323846;
-		const double half_fov = (double)cfg.fov_deg * 0.5 * (kPi / 180.0);
-		const double focal = ((double)sw * 0.5) / std::tan(half_fov);  // px
+		const double deg2rad = kPi / 180.0;
+		const double focal_x =
+			((double)sw * 0.5) / std::tan((double)cfg.fov_deg * 0.5 * deg2rad);
+		// Vertical focal: 0 -> square pixels (focal_y = focal_x), correct for a
+		// normal render. A stretched resolution makes pixels non-square; the real
+		// vertical FOV recovers the per-axis scale so X and Y stay exact.
+		const double focal_y = (cfg.fov_v_deg > 1.0f)
+			? ((double)sh * 0.5) / std::tan((double)cfg.fov_v_deg * 0.5 * deg2rad)
+			: focal_x;
 		const double counts_per_deg = 1.0 / ((double)cfg.game_sens * 0.07);
-		dx = std::atan(dx / focal) * (180.0 / kPi) * counts_per_deg;
-		dy = std::atan(dy / focal) * (180.0 / kPi) * counts_per_deg;
+		dx = std::atan(dx / focal_x) * (180.0 / kPi) * counts_per_deg;
+		dy = std::atan(dy / focal_y) * (180.0 / kPi) * counts_per_deg;
 	}
 
 	const double dist = std::sqrt(dx * dx + dy * dy);

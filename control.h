@@ -55,7 +55,13 @@ struct ControlConfig {
 	// Off -> the move is taken as 1 count = 1 screen px.
 	bool  calib_enable = false;
 	float game_sens    = 0.40f;   // in-game sensitivity (e.g. Valorant)
-	float fov_deg      = 103.0f;  // horizontal FOV (Valorant 16:9 = 103)
+	float fov_deg      = 103.0f;  // HORIZONTAL FOV (Valorant 16:9 = 103)
+	// Vertical FOV. 0 = auto (square pixels: focal_y = focal_x), correct for a
+	// normal un-stretched render. A STRETCHED resolution (e.g. a 16:9 image forced
+	// into a 21:9 screen) scales one axis by a fixed factor, making pixels
+	// non-square -> the single-focal assumption breaks. Set the real vertical FOV
+	// here to keep both axes exact under stretch.
+	float fov_v_deg    = 0.0f;
 };
 
 class Controller {
