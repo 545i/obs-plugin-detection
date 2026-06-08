@@ -122,6 +122,9 @@ static constexpr Backend  kBackend = Backend::DML;  // GPU via DirectML
 #define S_TRACK_SPEED_X  "track_speed_x"      // per-axis output multiplier (X)
 #define S_TRACK_SPEED_Y  "track_speed_y"      // per-axis output multiplier (Y)
 #define S_TRACK_LEAD     "track_lead"         // velocity lead/prediction (seconds)
+#define S_HUMANIZE       "humanize"           // human reaction delay + ease-in
+#define S_REACT_MS       "react_ms"           // reaction delay (ms) on new lock
+#define S_ACCEL_MS       "accel_ms"           // ease-in ramp duration (ms)
 
 // Box display mode (ported from ScreenCapture::setBoxDisplayMode):
 //   0 = head+body  : process ALL detections (== "head OR body" for the 2-class
@@ -170,6 +173,9 @@ static constexpr double kDefTrackSpeedX   = 1.0;   // per-axis output multiplier
 static constexpr double kDefTrackSpeedY   = 1.0;   // per-axis output multiplier (Y)
 static constexpr double kDefTrackLead     = 0.0;   // velocity lead/prediction (seconds);
                                                    // 0 by default -> integral does the work
+static constexpr bool   kDefHumanize      = false; // reaction delay + ease-in
+static constexpr double kDefReactMs       = 150.0; // reaction delay (ms)
+static constexpr double kDefAccelMs       = 120.0; // ease-in ramp (ms)
 
 static constexpr int    kDefBoxMode = 0;           // 0=head+body,1=head,2=head-track
 static constexpr int    kDefClsHead = 0;           // head class index in the model
@@ -351,6 +357,9 @@ struct detector_filter {
 	std::atomic<float> track_speed_x{(float)kDefTrackSpeedX};
 	std::atomic<float> track_speed_y{(float)kDefTrackSpeedY};
 	std::atomic<float> track_lead{(float)kDefTrackLead};
+	std::atomic<bool>  humanize{kDefHumanize};
+	std::atomic<float> react_ms{(float)kDefReactMs};
+	std::atomic<float> accel_ms{(float)kDefAccelMs};
 
 	// ---- box display mode (graphics thread): class filtering + track point ----
 	std::atomic<int>   box_mode{kDefBoxMode};
@@ -584,6 +593,9 @@ static void filter_update(void *data, obs_data_t *s)
 	f->track_speed_x.store((float)obs_data_get_double(s, S_TRACK_SPEED_X));
 	f->track_speed_y.store((float)obs_data_get_double(s, S_TRACK_SPEED_Y));
 	f->track_lead.store((float)obs_data_get_double(s, S_TRACK_LEAD));
+	f->humanize.store(obs_data_get_bool(s, S_HUMANIZE));
+	f->react_ms.store((float)obs_data_get_double(s, S_REACT_MS));
+	f->accel_ms.store((float)obs_data_get_double(s, S_ACCEL_MS));
 
 	f->box_mode.store((int)obs_data_get_int(s, S_BOX_MODE));
 	{
@@ -635,6 +647,9 @@ static ControlConfig build_control_config(detector_filter *f)
 	c.pov_w        = f->pov_w.load();
 	c.pov_h        = f->pov_h.load();
 	c.switch_ratio = kTrackSwitchRatio;
+	c.humanize     = f->humanize.load();
+	c.react_ms     = f->react_ms.load();
+	c.accel_ms     = f->accel_ms.load();
 	return c;
 }
 
@@ -696,6 +711,9 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context)
 	f->track_speed_x.store((float)obs_data_get_double(settings, S_TRACK_SPEED_X));
 	f->track_speed_y.store((float)obs_data_get_double(settings, S_TRACK_SPEED_Y));
 	f->track_lead.store((float)obs_data_get_double(settings, S_TRACK_LEAD));
+	f->humanize.store(obs_data_get_bool(settings, S_HUMANIZE));
+	f->react_ms.store((float)obs_data_get_double(settings, S_REACT_MS));
+	f->accel_ms.store((float)obs_data_get_double(settings, S_ACCEL_MS));
 
 	f->box_mode.store((int)obs_data_get_int(settings, S_BOX_MODE));
 	{
@@ -1301,6 +1319,9 @@ static void filter_get_defaults(obs_data_t *s)
 	obs_data_set_default_double(s, S_TRACK_SPEED_X, kDefTrackSpeedX);
 	obs_data_set_default_double(s, S_TRACK_SPEED_Y, kDefTrackSpeedY);
 	obs_data_set_default_double(s, S_TRACK_LEAD, kDefTrackLead);
+	obs_data_set_default_bool(s, S_HUMANIZE, kDefHumanize);
+	obs_data_set_default_double(s, S_REACT_MS, kDefReactMs);
+	obs_data_set_default_double(s, S_ACCEL_MS, kDefAccelMs);
 	obs_data_set_default_int(s, S_BOX_MODE, kDefBoxMode);
 	obs_data_set_default_int(s, S_CLS_HEAD, kDefClsHead);
 	obs_data_set_default_double(s, S_TRACK_OFFSET, kDefTrackOffset);
@@ -1431,6 +1452,14 @@ static obs_properties_t *filter_get_properties(void *data)
 	obs_property_t *tdz = obs_properties_add_float_slider(gt, S_TRACK_DEADZONE,
 	                                obs_module_text("TrackDeadzone"), 0.0, 200.0, 1.0);
 	obs_property_float_set_suffix(tdz, " px");
+	// Humanize (reaction delay + sigmoid ease-in, grounded in fnhum-16-979293).
+	obs_properties_add_bool(gt, S_HUMANIZE, obs_module_text("Humanize"));
+	obs_property_t *trm = obs_properties_add_int(gt, S_REACT_MS,
+	                                obs_module_text("ReactMs"), 0, 500, 5);
+	obs_property_int_set_suffix(trm, " ms");
+	obs_property_t *tam = obs_properties_add_int(gt, S_ACCEL_MS,
+	                                obs_module_text("AccelMs"), 0, 500, 5);
+	obs_property_int_set_suffix(tam, " ms");
 	obs_properties_add_group(p, "grp_track", obs_module_text("GrpTrack"),
 	                         OBS_GROUP_NORMAL, gt);
 

@@ -155,6 +155,17 @@ void Controller::tick()
 	locked_id_ = sel ? sel->id : -1;
 	if (!sel) return;
 
+	// Humanize timing: a fresh lock restarts the reaction-delay + ease-in clock.
+	const auto now = std::chrono::steady_clock::now();
+	if (locked_id_ != lock_prev_id_) {
+		lock_prev_id_ = locked_id_;
+		lock_time_ = now;
+	}
+	const double elapsed_ms =
+		std::chrono::duration<double, std::milli>(now - lock_time_).count();
+	if (cfg.humanize && elapsed_ms < (double)cfg.react_ms)
+		return;  // human reaction delay before the move starts
+
 	// Error = target's offset from the CROSSHAIR (= fixed screen center), in
 	// SCREEN px. NO GetCursorPos: in a cursor-locked game it doesn't reflect the
 	// crosshair. Linear extrapolation (pos + vel*lead) predicts the target's
@@ -183,18 +194,34 @@ void Controller::tick()
 	double mvx = dx * ease * (double)cfg.speed_x;
 	double mvy = dy * ease * (double)cfg.speed_y;
 
+	// Ease-IN ramp after a fresh lock (the sigmoid's rising edge): scale the move
+	// 0 -> 1 over accel_ms so the flick starts slow like a human, not instantly.
+	if (cfg.humanize && cfg.accel_ms > 0.0f) {
+		const double ramp = std::clamp(
+			(elapsed_ms - (double)cfg.react_ms) / (double)cfg.accel_ms, 0.0, 1.0);
+		mvx *= ramp;
+		mvy *= ramp;
+	}
+
 	// Small humanizing jitter scaled by distance (as in the reference).
 	const double js = std::min(1.0, dist / 200.0);
 	mvx += ((double)(::rand() % 7) - 3.0) * js;
 	mvy += ((double)(::rand() % 7) - 3.0) * js;
 
-	// Per-move clamp (like Aimmy2's Clamp(-150,150)): caps a single move so a big
-	// initial error can't overshoot/spin; the rest converges over later frames.
-	// A clamp below 1 px is meaningless (it would freeze all movement -- e.g. a
-	// stale value inherited from the old "PID D" field), so treat it as unlimited.
-	const double lim = (cfg.max_step >= 1.0f) ? (double)cfg.max_step : 30000.0;
-	mvx = std::clamp(mvx, -lim, lim);
-	mvy = std::clamp(mvy, -lim, lim);
+	// Per-move clamp (caps a single move so a big initial error can't overshoot/
+	// spin; the rest converges over later frames). VECTOR-magnitude clamp (like
+	// the reference output_limit) so it PRESERVES aim direction -- a per-axis
+	// clamp would distort diagonal moves. A clamp below 1 px is meaningless (it
+	// would freeze all movement, e.g. a stale value from the old "PID D" field),
+	// so treat it as unlimited.
+	if (cfg.max_step >= 1.0f) {
+		const double mag = std::sqrt(mvx * mvx + mvy * mvy);
+		if (mag > (double)cfg.max_step) {
+			const double s = (double)cfg.max_step / mag;
+			mvx *= s;
+			mvy *= s;
+		}
+	}
 	const short sdx = (short)mvx, sdy = (short)mvy;
 	if (sdx == 0 && sdy == 0) return;
 

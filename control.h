@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -39,6 +40,13 @@ struct ControlConfig {
 	bool  pov_enable   = false;
 	int   pov_w        = 600, pov_h = 600;
 	float switch_ratio = 0.80f;  // lock hysteresis: rival must be this much nearer
+	// Humanize (grounded in fnhum-16-979293: human aim = reaction delay + sigmoid
+	// move = slow start -> peak mid -> slow end). On lock-acquire: wait react_ms,
+	// then ease-in over accel_ms (the sigmoid's rising edge; ease-out comes free
+	// as the error shrinks near the target).
+	bool  humanize     = false;
+	float react_ms     = 150.0f;  // reaction delay before engaging a new target
+	float accel_ms     = 120.0f;  // ease-in (acceleration) ramp duration
 };
 
 class Controller {
@@ -77,4 +85,6 @@ private:
 	std::atomic<bool> running_{false};
 
 	int locked_id_ = -1;  // control thread only
+	int lock_prev_id_ = -1;  // for detecting a fresh lock (reaction-delay reset)
+	std::chrono::steady_clock::time_point lock_time_;  // when current lock began
 };
