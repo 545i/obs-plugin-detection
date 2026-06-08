@@ -186,14 +186,21 @@ void Controller::tick()
 	}
 
 	// Sensitivity calibration: convert the screen-px error into device COUNTS.
-	// deg/px = fov_deg/screen_width; counts/deg = 1/(sens*0.07). The device is
-	// raw 1:1 (measured), so OFF means 1 count = 1 screen px. After this the
-	// whole pipeline (ease, jitter, max_step clamp) is in counts.
-	if (cfg.calib_enable && cfg.game_sens > 0.0f) {
-		const double counts_per_px =
-			((double)cfg.fov_deg / (double)sw) / ((double)cfg.game_sens * 0.07);
-		dx *= counts_per_px;
-		dy *= counts_per_px;
+	// The camera is a PERSPECTIVE (rectilinear) projection, so screen px -> view
+	// angle is atan, NOT linear: theta = atan(px/focal), focal = (W/2)/tan(FOV/2)
+	// (same focal for X and Y -- square pixels). counts/deg = 1/(sens*0.07),
+	// verified against pro cm/360. A linear deg/px=FOV/W approximation under-rotates
+	// by ~40% at Valorant's 103deg FOV, which would force the user to re-tune speed;
+	// the atan form makes the entered in-game sens literally exact across the whole
+	// frame. The device is raw 1:1 (measured), so OFF means 1 count = 1 screen px.
+	// After this the whole pipeline (ease, jitter, max_step clamp) is in counts.
+	if (cfg.calib_enable && cfg.game_sens > 0.0f && cfg.fov_deg > 1.0f) {
+		constexpr double kPi = 3.14159265358979323846;
+		const double half_fov = (double)cfg.fov_deg * 0.5 * (kPi / 180.0);
+		const double focal = ((double)sw * 0.5) / std::tan(half_fov);  // px
+		const double counts_per_deg = 1.0 / ((double)cfg.game_sens * 0.07);
+		dx = std::atan(dx / focal) * (180.0 / kPi) * counts_per_deg;
+		dy = std::atan(dy / focal) * (180.0 / kPi) * counts_per_deg;
 	}
 
 	const double dist = std::sqrt(dx * dx + dy * dy);
